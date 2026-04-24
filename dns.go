@@ -27,31 +27,67 @@ const banner = `
     DNS SERVER IS LISTENING...
 `
 
-func parseQuesSection(buf []byte, start int) (string, int) {
+func parseName(buf []byte, curr int, maxLen int) (string, int, error) {
+	ptr := curr //will jump if meet compression
 	domain := ""
-	curr := start
+	jumped := false
+	nextPos := -1 // pos to read qtype after qname
+	jumpCount := 0
+	const maxJump = 5 //avoid loops
 
 	for {
-		length := int(buf[curr]) // length byte
-		if length == 0 {         //null label
-			curr++
+		if jumpCount > maxJump {
+			return "", 0, fmt.Errorf("too many jumps (potential loop)")
+		}
+		if ptr >= maxLen {
+			return "", 0, fmt.Errorf("out of bounds")
+		}
+
+		lenByte := buf[ptr]
+
+		// checking first 2 bits (11 is a pointer)
+		if (lenByte & 0xC0) == 0xC0 {
+			if ptr+1 >= maxLen {
+				return "", 0, fmt.Errorf("truncated pointer")
+			}
+
+			// 14 bits offset
+			offset := int(binary.BigEndian.Uint16(buf[ptr:ptr+2]) & 0x3FFF)
+
+			if !jumped {
+				nextPos = ptr + 2
+			}
+
+			ptr = offset //jump to the next offset to read
+			jumped = true
+			jumpCount++
+			continue
+		}
+
+		// read normal label
+		ptr++ //skip the length bit
+		if lenByte == 0 {
 			break
 		}
 
-		curr++ //moves to label
+		if ptr+int(lenByte) > maxLen {
+			return "", 0, fmt.Errorf("label length out of range")
+		}
 
-		label := string(buf[curr : curr+length])
-
+		label := string(buf[ptr : ptr+int(lenByte)])
 		if domain == "" {
 			domain = label
 		} else {
 			domain += "." + label
 		}
-
-		curr += length
+		ptr += int(lenByte)
 	}
 
-	return domain, curr
+	if !jumped {
+		nextPos = ptr
+	}
+
+	return domain, nextPos, nil
 }
 
 func main() {
@@ -112,18 +148,36 @@ func main() {
 			fmt.Printf("Opcode: %d\t", opcode)
 			fmt.Printf("RD: %d\t", rd)
 			fmt.Printf("QDCOUNT: %d\n", qdCount)
+
+			fmt.Println("QUESTION SECTION")
+			fmt.Printf("--- Parsing %d Question(s) ---\n", qdCount)
+
+			curr := 12
+
+			for i := 0; i < int(qdCount); i++ {
+				//parsing the name
+				domain, nextPos, err := parseName(buf, curr, n)
+				if err != nil {
+					fmt.Printf("Error parsing question %d: %v\n", i, err)
+					break
+				}
+
+				// check next 4 byte(qtype and qclass)
+				if nextPos+4 > n {
+					fmt.Println("Error: Not enough data for QTYPE/QCLASS")
+					break
+				}
+
+				qType := binary.BigEndian.Uint16(buf[nextPos : nextPos+2])
+				qClass := binary.BigEndian.Uint16(buf[nextPos+2 : nextPos+4])
+
+				fmt.Printf("#%d | Name: %s | Type: %d | Class: %d\n", i+1, domain, qType, qClass)
+
+				// update curr
+				curr = nextPos + 4
+			}
+
 		}
-
-		fmt.Println("QUESTION SECTION")
-
-		domain, curr := parseQuesSection(buf, 12)
-		//qtype will start after null label (2 bytes), qclass 2 bytes
-		qType := binary.BigEndian.Uint16(buf[curr : curr+2])
-		qClass := binary.BigEndian.Uint16(buf[curr+2 : curr+4])
-
-		fmt.Printf("QNAME: %s\t", domain)
-		fmt.Printf("QTYPE: %d\t", qType)
-		fmt.Printf("QCLASS: %d\n", qClass)
 
 		if err != nil {
 			fmt.Println("Error:", err)
