@@ -52,13 +52,13 @@ func parseName(buf []byte, curr int, maxLen int) (string, int, error) {
 			}
 
 			// 14 bits offset
-			offset := int(binary.BigEndian.Uint16(buf[ptr:ptr+2]) & 0x3FFF)
+			offset := int(binary.BigEndian.Uint16(buf[ptr:ptr+2]) & 0x3FFF) //check where is the pointer point to
 
 			if !jumped {
 				nextPos = ptr + 2
 			}
 
-			ptr = offset //jump to the next offset to read
+			ptr = offset //go back to that address
 			jumped = true
 			jumpCount++
 			continue
@@ -96,6 +96,15 @@ func main() {
 	//mo cong ket noi bang listenUDP
 	connect, errr := net.ListenUDP("udp", &addr) //tra ve UDPConn va error
 
+	//lets connect to google and become a fowarder
+	network, dialErr := net.Dial("udp", "8.8.8.8:53") //its google public dns server port 53
+
+	if dialErr != nil {
+		fmt.Println("Error: ", dialErr)
+		return
+	}
+	defer network.Close()
+
 	if errr != nil {
 		fmt.Println("Error:", errr)
 		return
@@ -103,7 +112,7 @@ func main() {
 
 	defer connect.Close() //phong truong hop bi loi thi van co the out
 
-	fmt.Println(banner)
+	fmt.Println(banner2)
 
 	for {
 		//chuan bi nhan du lieu
@@ -176,13 +185,30 @@ func main() {
 				// update curr
 				curr = nextPos + 4
 			}
+		}
+		//send question section and receive a reply
+		network.Write(buf[:n]) //sending
+		reply := make([]byte, 512)
+		nreply, rError := network.Read(reply)
 
+		if rError != nil {
+			fmt.Println("Error: ", rError)
+			continue
+		}
+
+		_, wError := connect.WriteToUDP(reply[:nreply], address)
+
+		if wError != nil {
+			fmt.Println("Error: ", wError)
+			continue
 		}
 
 		if err != nil {
-			fmt.Println("Error:", err)
+			fmt.Println("Error: ", err)
 			continue
 		}
 	}
 
 }
+
+//if it not say anything try "nslookup google.com 127.0.0.1" in another powershell
