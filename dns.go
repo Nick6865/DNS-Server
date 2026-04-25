@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"time"
 )
 
 const banner = `
@@ -112,16 +113,19 @@ func main() {
 
 	defer connect.Close() //phong truong hop bi loi thi van co the out
 
-	fmt.Println(banner2)
+	fmt.Println(banner)
 
 	for {
+		//add time
+		now := time.Now().Format("2006-01-02 15:04:05")
+
 		//chuan bi nhan du lieu
 		buf := make([]byte, 512)
 		//ReadFromUDP tra ve int(number of byte), Addr va error
 		n, address, err := connect.ReadFromUDP(buf)
 
 		//if it not say anything try "nslookup google.com 127.0.0.1" in another powershell
-		fmt.Printf("Received %d bytes from %s:\n", n, address)
+		fmt.Printf("\n[%s] Received %d bytes from %s:\n", now, n, address)
 
 		//have fun with header
 		var id, qr, opcode, rd, qdCount uint16
