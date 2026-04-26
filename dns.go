@@ -91,29 +91,87 @@ func parseName(buf []byte, curr int, maxLen int) (string, int, error) {
 	return domain, nextPos, nil
 }
 
+func handlePacket(connect *net.UDPConn, upstream net.Conn, address net.Addr, n int, buf []byte) {
+	defer recover()
+	// using parse to get query info to print
+	if n >= 12 {
+		id := binary.BigEndian.Uint16(buf[0:2])
+		qdCount := binary.BigEndian.Uint16(buf[4:6])
+
+		fmt.Print("HEADER SECTION: \n")
+		fmt.Printf(" [Log] Query ID: %d | Questions: %d\n", id, qdCount)
+
+		curr := 12
+		for i := 0; i < int(qdCount); i++ {
+			domain, nextPos, err := parseName(buf, curr, n)
+			if err == nil {
+				// check next 4 byte(qtype and qclass)
+				if nextPos+4 > n {
+					fmt.Println("Error: Not enough data for QTYPE/QCLASS")
+					break
+				}
+				fmt.Print("QUESTION SECTION: \n")
+				qType := binary.BigEndian.Uint16(buf[nextPos : nextPos+2])
+				qClass := binary.BigEndian.Uint16(buf[nextPos+2 : nextPos+4])
+				fmt.Printf(" [Log] Requesting: %s \t| Type: %d |\t Class: %d\n", domain, qType, qClass)
+				curr = nextPos + 4
+			}
+		}
+	}
+
+	_, err := upstream.Write(buf[:n])
+	if err != nil {
+		fmt.Println("Failed to forward query:", err)
+		return
+	}
+
+	// receive a reply
+	reply := make([]byte, 2048)
+	//set deadline
+	nReply, err := upstream.Read(reply)
+	if err != nil {
+		fmt.Println("Failed to read reply from upstream:", err)
+		return
+	}
+
+	//send back to client
+	udpAddr, ok := address.(*net.UDPAddr)
+	if !ok {
+		fmt.Println("Invalid client address type")
+		return
+	}
+
+	_, err = connect.WriteToUDP(reply[:nReply], udpAddr)
+	if err != nil {
+		fmt.Println("Failed back to client:", err)
+	} else {
+		fmt.Printf(" [OK] Answered %s\n", udpAddr.String())
+	}
+}
+
 func main() {
 
 	addr := net.UDPAddr{Port: 53, IP: net.ParseIP("0.0.0.0")} //dia chi nghe
 	//mo cong ket noi bang listenUDP
 	connect, errr := net.ListenUDP("udp", &addr) //tra ve UDPConn va error
 
-	//lets connect to google and become a fowarder
-	network, dialErr := net.Dial("udp", "8.8.8.8:53") //its google public dns server port 53
-
-	if dialErr != nil {
-		fmt.Println("Error: ", dialErr)
+	//forward to google dns
+	upstream, err := net.DialTimeout("udp", "8.8.8.8:53", 2*time.Second)
+	if err != nil {
+		fmt.Println("Failed to connect to upstream:", err)
 		return
 	}
-	defer network.Close()
+	defer upstream.Close()
 
 	if errr != nil {
 		fmt.Println("Error:", errr)
 		return
 	}
-
 	defer connect.Close() //phong truong hop bi loi thi van co the out
 
 	fmt.Println(banner)
+
+	fmt.Println("DNS FORWARDER IS RUNNING ON PORT 53...")
 
 	for {
 		//add time
@@ -122,97 +180,21 @@ func main() {
 		//chuan bi nhan du lieu
 		buf := make([]byte, 512)
 		//ReadFromUDP tra ve int(number of byte), Addr va error
-		n, address, err := connect.ReadFromUDP(buf)
-
-		//if it not say anything try "nslookup google.com 127.0.0.1" in another powershell
-		fmt.Printf("\n[%s] Received %d bytes from %s:\n", now, n, address)
-
-		//have fun with header
-		var id, qr, opcode, rd, qdCount uint16
-		var msgType string = "Unknown"
-		if n >= 12 {
-			fmt.Println("HEADER SECTION")
-
-			id = binary.BigEndian.Uint16(buf[0:2])
-
-			flags := binary.BigEndian.Uint16(buf[2:4])
-			//extracting bits
-			qr = flags >> 15
-			if qr == 1 {
-				msgType = "Response"
-			} else {
-				msgType = "Query"
-			}
-			opcode = (flags >> 11) & 0xF
-			rd = (flags >> 8) & 1
-
-			qdCount = binary.BigEndian.Uint16(buf[4:6])
-
-			/*anCount := binary.BigEndian.Uint16(buf[6:8])
-
-			  nsCount := binary.BigEndian.Uint16(buf[8:10])
-
-			  arCount := binary.BigEndian.Uint16(buf[10:12])
-
-			  so the question section should be from 12 to 17??
-			*/
-			fmt.Printf("ID: %v\t", id)
-			fmt.Printf("QR: %v\t", msgType)
-			fmt.Printf("Opcode: %d\t", opcode)
-			fmt.Printf("RD: %d\t", rd)
-			fmt.Printf("QDCOUNT: %d\n", qdCount)
-
-			fmt.Println("QUESTION SECTION")
-			fmt.Printf("--- Parsing %d Question(s) ---\n", qdCount)
-
-			curr := 12
-
-			for i := 0; i < int(qdCount); i++ {
-				//parsing the name
-				domain, nextPos, err := parseName(buf, curr, n)
-				if err != nil {
-					fmt.Printf("Error parsing question %d: %v\n", i, err)
-					break
-				}
-
-				// check next 4 byte(qtype and qclass)
-				if nextPos+4 > n {
-					fmt.Println("Error: Not enough data for QTYPE/QCLASS")
-					break
-				}
-
-				qType := binary.BigEndian.Uint16(buf[nextPos : nextPos+2])
-				qClass := binary.BigEndian.Uint16(buf[nextPos+2 : nextPos+4])
-
-				fmt.Printf("#%d | Name: %s | Type: %d | Class: %d\n", i+1, domain, qType, qClass)
-
-				// update curr
-				curr = nextPos + 4
-			}
-		}
-		//send question section and receive a reply
-		network.Write(buf[:n]) //sending
-		reply := make([]byte, 512)
-		nreply, rError := network.Read(reply)
-
-		if rError != nil {
-			fmt.Println("Error: ", rError)
-			continue
-		}
-
-		_, wError := connect.WriteToUDP(reply[:nreply], address)
-
-		if wError != nil {
-			fmt.Println("Error: ", wError)
-			continue
-		}
+		n, ClientAddress, err := connect.ReadFromUDP(buf)
 
 		if err != nil {
-			fmt.Println("Error: ", err)
+			fmt.Println("Read Error:", err)
 			continue
 		}
-	}
 
+		packetData := make([]byte, n)
+		copy(packetData, buf[:n])
+
+		//if it not say anything try "nslookup google.com 127.0.0.1" in another powershell
+		fmt.Printf("\n[%s] Received %d bytes from %s:\n", now, n, ClientAddress)
+
+		go handlePacket(connect, upstream, ClientAddress, n, packetData)
+	}
 }
 
 //if it not say anything try "nslookup google.com 127.0.0.1" in another powershell
