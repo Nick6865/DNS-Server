@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"net"
+	"os"
+	"strings"
 	"time"
 )
+
+var blacklistMap map[string]bool
 
 const banner = `
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣤⣶⣶⣶⣶⣶⣶⣦⣄⡀⠀⠀⠀⠀
@@ -91,7 +96,59 @@ func parseName(buf []byte, curr int, maxLen int) (string, int, error) {
 	return domain, nextPos, nil
 }
 
-func handlePacket(connect *net.UDPConn, upstream net.Conn, address net.Addr, n int, buf []byte) {
+func loadBlackList(filename string) (map[string]bool, error) {
+	list := make(map[string]bool)
+	file, err := os.Open(filename)
+
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		domain := strings.TrimSpace(scanner.Text())
+		if domain != "" && !strings.HasPrefix(domain, "#") {
+			list[domain] = true
+		}
+	}
+	return list, scanner.Err()
+}
+
+func sendNXDomain(connect *net.UDPConn, address net.Addr, buf []byte) {
+	reply := make([]byte, len(buf))
+	copy(reply, buf)
+	//change the packet(flags in header)
+	/*reply[2] = 0x81 //10000001
+	reply[3] = 0x83 //10000011 the last 4 bit is NXDOMAIN error*/
+
+	flags := binary.BigEndian.Uint16(buf[2:4])
+	var responseFlags uint16
+
+	responseFlags |= (1 << 15)          //Bit QR (15): 0 -> 1 (query to response)
+	responseFlags |= (1 << 10)          //Bit AA (10): 1 (our server holding this question)
+	responseFlags |= (flags & (1 << 8)) //RD keeps this RD from client
+	responseFlags |= (1 << 7)           //RA (Server supports recursion)
+	responseFlags |= 3                  //RCODE: NXDOMAIN in last 4 bits
+
+	binary.BigEndian.PutUint16(reply[2:4], responseFlags)
+
+	udpAddr, ok := address.(*net.UDPAddr)
+	if !ok {
+		fmt.Println("Invalid client address type")
+		return
+	}
+	_, err := connect.WriteToUDP(reply, udpAddr)
+	if err != nil {
+		fmt.Println("Failed back to client:", err)
+	} else {
+		fmt.Printf(" [OK] Answered %s\n", udpAddr.String())
+	}
+
+	fmt.Printf(" [!] Blocked & Sent NXDOMAIN to %s\n", udpAddr.String())
+}
+
+func handlePacket(connect *net.UDPConn, upstream net.Conn, address net.Addr, n int, buf []byte, blacklist map[string]bool) {
 	defer recover()
 	// using parse to get query info to print
 	if n >= 12 {
@@ -104,6 +161,14 @@ func handlePacket(connect *net.UDPConn, upstream net.Conn, address net.Addr, n i
 		curr := 12
 		for i := 0; i < int(qdCount); i++ {
 			domain, nextPos, err := parseName(buf, curr, n)
+
+			//if the domain is an ad domain or you don't want this domain to appear create a blacklist to block it (send a fake error packet to google by using bitwise manipulation)
+			if blacklist[domain] {
+				fmt.Printf(" [!] Domain blocked: %s\n", domain)
+				sendNXDomain(connect, address, buf)
+				return
+			}
+
 			if err == nil {
 				// check next 4 byte(qtype and qclass)
 				if nextPos+4 > n {
@@ -113,7 +178,7 @@ func handlePacket(connect *net.UDPConn, upstream net.Conn, address net.Addr, n i
 				fmt.Print("QUESTION SECTION: \n")
 				qType := binary.BigEndian.Uint16(buf[nextPos : nextPos+2])
 				qClass := binary.BigEndian.Uint16(buf[nextPos+2 : nextPos+4])
-				fmt.Printf(" [Log] Requesting: %s \t| Type: %d |\t Class: %d\n", domain, qType, qClass)
+				fmt.Printf(" [Log] Requesting: %s \t| Type: %d | Class: %d\n", domain, qType, qClass)
 				curr = nextPos + 4
 			}
 		}
@@ -150,6 +215,16 @@ func handlePacket(connect *net.UDPConn, upstream net.Conn, address net.Addr, n i
 }
 
 func main() {
+	//creating a blacklist
+	var err error
+	blacklistMap, err = loadBlackList("blacklist.txt")
+
+	if err != nil {
+		fmt.Println("Warning: cannot fine blacklist.txt, creating a new blacklistMap")
+		blacklistMap = make(map[string]bool)
+	} else {
+		fmt.Printf("Add %d domain to blacklist.\n", len(blacklistMap))
+	}
 
 	addr := net.UDPAddr{Port: 53, IP: net.ParseIP("0.0.0.0")} //dia chi nghe
 	//mo cong ket noi bang listenUDP
@@ -193,7 +268,7 @@ func main() {
 		//if it not say anything try "nslookup google.com 127.0.0.1" in another powershell
 		fmt.Printf("\n[%s] Received %d bytes from %s:\n", now, n, ClientAddress)
 
-		go handlePacket(connect, upstream, ClientAddress, n, packetData)
+		go handlePacket(connect, upstream, ClientAddress, n, packetData, blacklistMap)
 	}
 }
 
