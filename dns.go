@@ -10,8 +10,6 @@ import (
 	"time"
 )
 
-var blacklistMap map[string]bool
-
 const banner = `
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣤⣶⣶⣶⣶⣶⣶⣦⣄⡀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣾⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⠀⠀⠀
@@ -32,6 +30,51 @@ const banner = `
 
     DNS SERVER IS LISTENING...
 `
+
+var blacklistMap map[string]bool
+
+type DNSHeader struct {
+	ID      uint16
+	Flags   uint16
+	QDCount uint16 // Number of Questions
+	ANCount uint16 // Number of Answers
+	NSCount uint16 // Number of Authorities
+	ARCount uint16 // Number of Additionals
+}
+
+type DNSQuestion struct {
+	Name  string
+	Type  uint16
+	Class uint16
+}
+
+func ParseHeader(buf []byte) DNSHeader {
+	return DNSHeader{
+		ID:      binary.BigEndian.Uint16(buf[0:2]),
+		Flags:   binary.BigEndian.Uint16(buf[2:4]),
+		QDCount: binary.BigEndian.Uint16(buf[4:6]),
+		ANCount: binary.BigEndian.Uint16(buf[6:8]),
+		NSCount: binary.BigEndian.Uint16(buf[8:10]),
+		ARCount: binary.BigEndian.Uint16(buf[10:12]),
+	}
+}
+
+func (h *DNSHeader) Pack(buf []byte) {
+	binary.BigEndian.PutUint16(buf[0:2], h.ID)
+	binary.BigEndian.PutUint16(buf[2:4], h.Flags)
+	binary.BigEndian.PutUint16(buf[4:6], h.QDCount)
+	binary.BigEndian.PutUint16(buf[6:8], h.ANCount)
+	binary.BigEndian.PutUint16(buf[8:10], h.NSCount)
+	binary.BigEndian.PutUint16(buf[10:12], h.ARCount)
+}
+
+func (h *DNSHeader) SetNXDOMAIN() {
+	h.Flags |= (1 << 15) // QR = 1 (Response)
+	h.Flags |= (1 << 10) // AA = 1 (Authoritative)
+	h.Flags |= (1 << 7)  // RA = 1 (Recursion Available)
+	h.Flags &= 0xFFF0    // delete old rdcode
+	h.Flags |= 3         // RCODE = 3 (NXDOMAIN)
+}
 
 func parseName(buf []byte, curr int, maxLen int) (string, int, error) {
 	ptr := curr //will jump if meet compression
@@ -115,102 +158,99 @@ func loadBlackList(filename string) (map[string]bool, error) {
 	return list, scanner.Err()
 }
 
-func sendNXDomain(connect *net.UDPConn, address net.Addr, buf []byte) {
-	reply := make([]byte, len(buf))
-	copy(reply, buf)
-	//change the packet(flags in header)
-	/*reply[2] = 0x81 //10000001
-	reply[3] = 0x83 //10000011 the last 4 bit is NXDOMAIN error*/
-
-	flags := binary.BigEndian.Uint16(buf[2:4])
-	var responseFlags uint16
-
-	responseFlags |= (1 << 15)          //Bit QR (15): 0 -> 1 (query to response)
-	responseFlags |= (1 << 10)          //Bit AA (10): 1 (our server holding this question)
-	responseFlags |= (flags & (1 << 8)) //RD keeps this RD from client
-	responseFlags |= (1 << 7)           //RA (Server supports recursion)
-	responseFlags |= 3                  //RCODE: NXDOMAIN in last 4 bits
-
-	binary.BigEndian.PutUint16(reply[2:4], responseFlags)
-
-	udpAddr, ok := address.(*net.UDPAddr)
-	if !ok {
-		fmt.Println("Invalid client address type")
-		return
-	}
-	_, err := connect.WriteToUDP(reply, udpAddr)
-	if err != nil {
-		fmt.Println("Failed back to client:", err)
-	} else {
-		fmt.Printf(" [OK] Answered %s\n", udpAddr.String())
-	}
-
-	fmt.Printf(" [!] Blocked & Sent NXDOMAIN to %s\n", udpAddr.String())
-}
-
 func handlePacket(connect *net.UDPConn, upstream net.Conn, address net.Addr, n int, buf []byte, blacklist map[string]bool) {
-	defer recover()
-	// using parse to get query info to print
-	if n >= 12 {
-		id := binary.BigEndian.Uint16(buf[0:2])
-		qdCount := binary.BigEndian.Uint16(buf[4:6])
-
-		fmt.Print("HEADER SECTION: \n")
-		fmt.Printf(" [Log] Query ID: %d | Questions: %d\n", id, qdCount)
-
-		curr := 12
-		for i := 0; i < int(qdCount); i++ {
-			domain, nextPos, err := parseName(buf, curr, n)
-
-			//if the domain is an ad domain or you don't want this domain to appear create a blacklist to block it (send a fake error packet to google by using bitwise manipulation)
-			if blacklist[domain] {
-				fmt.Printf(" [!] Domain blocked: %s\n", domain)
-				sendNXDomain(connect, address, buf)
-				return
-			}
-
-			if err == nil {
-				// check next 4 byte(qtype and qclass)
-				if nextPos+4 > n {
-					fmt.Println("Error: Not enough data for QTYPE/QCLASS")
-					break
-				}
-				fmt.Print("QUESTION SECTION: \n")
-				qType := binary.BigEndian.Uint16(buf[nextPos : nextPos+2])
-				qClass := binary.BigEndian.Uint16(buf[nextPos+2 : nextPos+4])
-				fmt.Printf(" [Log] Requesting: %s \t| Type: %d | Class: %d\n", domain, qType, qClass)
-				curr = nextPos + 4
-			}
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf(" [!] Packet error: %v\n", r)
 		}
-	}
+	}()
 
-	_, err := upstream.Write(buf[:n])
-	if err != nil {
-		fmt.Println("Failed to forward query:", err)
+	if n < 12 {
 		return
 	}
 
-	// receive a reply
-	reply := make([]byte, 2048)
-	//set deadline
+	header := ParseHeader(buf)
+	now := time.Now().Format("2006-01-02 15:04:05")
+
+	fmt.Printf("\n\033[36m[%s] Received %d bytes from %s\033[0m\n", now, n, address.String())
+	fmt.Printf("\033[33mHEADER SECTION:\033[0m\n")
+	fmt.Printf(" [Log] Query ID: %d | Questions: %d\n", header.ID, header.QDCount)
+
+	curr := 12
+
+	fmt.Printf("\033[33mQUESTION SECTION:\033[0m\n")
+
+	for i := 0; i < int(header.QDCount); i++ {
+		domain, nextPos, err := parseName(buf, curr, n)
+		if err != nil {
+			return
+		}
+
+		//checking blacklist
+		if blacklist[domain] {
+			fmt.Printf(" \033[31m[!] Domain blocked: %s\033[0m\n", domain)
+
+			//use struct to make it faster
+			header.SetNXDOMAIN()
+
+			reply := make([]byte, n)
+			copy(reply, buf[:n])
+			header.Pack(reply) //write fixed header to packet
+
+			udpAddr, _ := address.(*net.UDPAddr)
+			connect.WriteToUDP(reply, udpAddr)
+			return
+		}
+
+		qType := binary.BigEndian.Uint16(buf[nextPos : nextPos+2])
+		qClass := binary.BigEndian.Uint16(buf[nextPos+2 : nextPos+4])
+
+		fmt.Printf(" [Log] Requesting: \033[36m%s\033[0m\t| Type: %d\t| Class: %d\n", domain, qType, qClass)
+
+		curr = nextPos + 4
+	}
+
+	// connect to upstream and add timeout
+	upstream, err := net.DialTimeout("udp", "8.8.8.8:53", 1*time.Second)
+	if err != nil {
+		fmt.Println(" [!] Upstream error:", err)
+		return
+	}
+	defer upstream.Close()
+
+	//send request
+	_, err = upstream.Write(buf[:n])
+	if err != nil {
+		fmt.Println(" [!] Failed to forward query:", err)
+		return
+	}
+
+	//set deadline if >1sec skip it
+	upstream.SetReadDeadline(time.Now().Add(1 * time.Second))
+
+	//receive answer
+	reply := make([]byte, 1024)
 	nReply, err := upstream.Read(reply)
 	if err != nil {
-		fmt.Println("Failed to read reply from upstream:", err)
+		fmt.Println(" [!] No response from Google (Timeout/Error):", err)
 		return
 	}
 
-	//send back to client
+	resID := binary.BigEndian.Uint16(reply[0:2])
+
+	fmt.Printf("\033[32m[RESOLVED]\033[0m | ID: %05d | Bytes: %d\n", resID, nReply)
+
 	udpAddr, ok := address.(*net.UDPAddr)
 	if !ok {
-		fmt.Println("Invalid client address type")
+		fmt.Println(" [!] Invalid client address type")
 		return
 	}
 
 	_, err = connect.WriteToUDP(reply[:nReply], udpAddr)
 	if err != nil {
-		fmt.Println("Failed back to client:", err)
+		fmt.Println(" [!] Failed back to client:", err)
 	} else {
-		fmt.Printf(" [OK] Answered %s\n", udpAddr.String())
+		fmt.Printf(" \033[32m[OK] Answered %s\033[0m\n", udpAddr.String())
 	}
 }
 
@@ -249,9 +289,6 @@ func main() {
 	fmt.Println("DNS FORWARDER IS RUNNING ON PORT 53...")
 
 	for {
-		//add time
-		now := time.Now().Format("2006-01-02 15:04:05")
-
 		//chuan bi nhan du lieu
 		buf := make([]byte, 512)
 		//ReadFromUDP tra ve int(number of byte), Addr va error
@@ -266,8 +303,6 @@ func main() {
 		copy(packetData, buf[:n])
 
 		//if it not say anything try "nslookup google.com 127.0.0.1" in another powershell
-		fmt.Printf("\n[%s] Received %d bytes from %s:\n", now, n, ClientAddress)
-
 		go handlePacket(connect, upstream, ClientAddress, n, packetData, blacklistMap)
 	}
 }
