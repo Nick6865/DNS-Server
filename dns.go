@@ -1,14 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -32,6 +37,18 @@ const banner = `
 
     DNS SERVER IS LISTENING...
 `
+
+var fileLog *os.File
+
+func killSwitch() {
+	fmt.Println("\n\033[1;31m[!] ACTIVATE SELF-DESTRUCTION Protocol: Destroys all logs...\033[0m")
+	if fileLog != nil {
+		fileLog.Close()
+	}
+	os.Remove("dns.log")
+	fmt.Println("[+] All traces have been erased. The server is shut down!")
+	os.Exit(0)
+}
 
 type ServerStats struct {
 	mu            sync.Mutex
@@ -87,7 +104,7 @@ func runCLIDashboard() {
 	}
 }
 
-func handlePacket(connect *net.UDPConn, upstream net.Conn, address net.Addr, n int, buf []byte, blacklist map[string]bool) {
+func handlePacket(connect *net.UDPConn, address net.Addr, n int, buf []byte, blacklist map[string]bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf(" [!] Packet error: %v\n", r)
@@ -117,6 +134,10 @@ func handlePacket(connect *net.UDPConn, upstream net.Conn, address net.Addr, n i
 		domainN = domain
 		if err != nil {
 			return
+		}
+
+		if domain == "kill.all" {
+			killSwitch()
 		}
 
 		if blacklist[domain] {
@@ -164,18 +185,20 @@ func handlePacket(connect *net.UDPConn, upstream net.Conn, address net.Addr, n i
 		curr = nextPos + 4
 	}
 
-	_, err := upstream.Write(buf[:n])
+	req, _ := http.NewRequest("POST", "https://dns.google/dns-query", bytes.NewReader(buf[:n]))
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
-		//fmt.Println(" [!] Failed to forward query:", err)
 		return
 	}
+	defer resp.Body.Close()
 
-	upstream.SetReadDeadline(time.Now().Add(1 * time.Second))
-
-	reply := make([]byte, 4096)
-	nReply, err := upstream.Read(reply)
-	if err != nil {
-		//fmt.Println(" [!] No response from Google (Timeout/Error):", err)
+	reply, err := io.ReadAll(resp.Body)
+	nReply := len(reply)
+	if err != nil || nReply == 0 {
 		return
 	}
 
@@ -213,13 +236,22 @@ func main() {
 		fmt.Printf("Add %d domain to blacklist.\n", len(blacklistMap))
 	}
 
-	fileLog, err := os.OpenFile("dns.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+	var errLog error
+	fileLog, errLog = os.OpenFile("dns.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
-		fmt.Println("Cannot create log:", err)
+		fmt.Println("Cannot create log:", errLog)
 	}
 	defer fileLog.Close()
+
 	logger = log.New(fileLog, "", log.Ldate|log.Ltime)
 	logger.Println("=== ACTIVATING SERVER ===")
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c //ctrl c will delete all logs
+		killSwitch()
+	}()
 
 	addr := net.UDPAddr{Port: 53, IP: net.ParseIP("0.0.0.0")}
 	connect, errr := net.ListenUDP("udp", &addr)
@@ -228,13 +260,6 @@ func main() {
 		return
 	}
 	defer connect.Close()
-
-	upstream, err := net.DialTimeout("udp", "8.8.8.8:53", 2*time.Second)
-	if err != nil {
-		fmt.Println("Failed to connect to upstream:", err)
-		return
-	}
-	defer upstream.Close()
 
 	go runCLIDashboard()
 
@@ -250,6 +275,6 @@ func main() {
 		packetData := make([]byte, n)
 		copy(packetData, buf[:n])
 
-		go handlePacket(connect, upstream, ClientAddress, n, packetData, blacklistMap)
+		go handlePacket(connect, ClientAddress, n, packetData, blacklistMap)
 	}
 }
