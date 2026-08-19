@@ -1,41 +1,73 @@
-# DNS Sniffer & Redirection Framework
-A high-performance DNS interception and redirection tool written in Go, designed for network security auditing and traffic analysis. This framework enables real-time monitoring of DNS queries and conditional redirection based on predefined rules.
+# Local DNS Ad-Blocker
+
+A lightweight local DNS server written in Go that blocks ads and 
+trackers, similar in concept to Pi-hole. It resolves known 
+ad-serving/tracking domains to a null address instead of forwarding 
+them to the real internet, and forwards all other queries to a 
+normal upstream DNS resolver.
 
 ## Overview
-This project provides a robust solution for capturing DNS traffic at the packet level. By leveraging Go's concurrency model, it ensures low-latency processing even under significant network load.
 
-## Key Features
-- **Packet-Level Interception:** Utilizes raw sockets to monitor and parse DNS queries.
-- **Dynamic Redirection:** Implements logic to redirect specific domains to designated IP addresses.
-- **Comprehensive Logging:** Records all intercepted queries and responses for forensic analysis.
-- **Integrated Kill Switch:** A built-in security mechanism to immediately terminate processes and purge sensitive logs upon command.
-- **Stateless Operation:** Designed for minimal memory footprint and high stability.
+This project was built as a learning exercise to understand the DNS 
+protocol at the wire format level — parsing raw DNS headers and 
+question sections instead of relying on high-level DNS libraries.
 
-## Technical Architecture
-The framework operates by binding to port 53 and analyzing incoming UDP packets. It decodes the DNS wire format to extract queries and applies a redirection filter:
-1. **Interception:** Captures incoming UDP packets on the local interface.
-2. **Parsing:** Extracts the Domain Name System (DNS) header and question section.
-3. **Filtering:** Checks the requested domain against a local redirection table.
-4. **Response:** Forges a DNS response (A Record) pointing to the target IP if a match is found.
+## Features
+
+- **DNS query parsing**: decodes DNS header and question section 
+  from raw UDP packets
+- **Blocklist-based filtering**: checks each requested domain against 
+  a local blocklist (`blacklist.txt`)
+- **Ad/tracker blocking**: returns a null response (0.0.0.0) for 
+  blocklisted domains instead of forwarding them
+- **Query logging**: logs incoming queries for debugging and 
+  inspection during development
+- **Caching**: basic response caching to reduce repeated lookups
+
+## How it works
+
+1. Listens for DNS queries on UDP port 53 on the local network
+2. Parses the DNS header and question section
+3. Checks the requested domain against the blocklist
+4. If blocked → returns 0.0.0.0 (ad/tracker blocked)
+5. If not blocked → forwards the query to a real upstream resolver 
+   and returns the actual response
 
 ## Installation
-Ensure you have the Go runtime installed on your system.
+
 ```bash
-# Clone the repository
-git clone [https://github.com/Nick6865/DNS-Server](https://github.com/Nick6865/DNS-Server)
-# Navigate to the project directory
+git clone https://github.com/Nick6865/DNS-Server
 cd DNS-Server
-# Build the binary
 go build dns.go
 ```
 
 ## Usage
+
 ```bash
 sudo ./dns
 ```
 
-## Safety Mechanism (Kill Switch)
-To trigger the automated log purge and safe shutdown, use the designated interrupt signal (Ctrl+C). The killSwitch() function will execute immediately to ensure no data remains in the active log files.
+## Notes on logging
 
-## Legal Disclaimer
-This software is provided for educational purposes and authorized security testing only. Unauthorized use of this tool against networks without explicit permission is illegal and unethical. The developer assumes no liability for misuse or damage caused by this software.
+Query logs (`dns.log`) can grow quickly during testing. This is a 
+learning/demo project, not a production log-management setup — for 
+now, logs are cleared on shutdown (Ctrl+C) simply to avoid 
+accumulating large files during repeated test runs on a personal 
+machine. This is **not** intended as a way to conceal activity; 
+in a real deployment, log rotation (e.g. capping file size and 
+archiving old entries) would replace this, since permanently 
+deleting logs is not appropriate for any tool meant to run 
+persistently or be relied on for troubleshooting.
+
+## Scope
+
+This project only intercepts and responds to DNS queries on the 
+local network for ad-blocking purposes — it does not spoof or 
+redirect traffic for any domain outside the blocklist, and it is 
+only intended to run on networks/devices the user owns or has 
+explicit permission to configure.
+
+## Disclaimer
+
+Built for personal learning about the DNS protocol and network 
+programming in Go. Not intended for production use as-is.
